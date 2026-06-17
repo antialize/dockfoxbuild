@@ -1,0 +1,17 @@
+[package]
+name = "dockfoxbuild"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+chrono = "0.4"
+clap = {version = "4", features = ["derive"]}
+crossbeam = {version = "0.8", features = ["crossbeam-channel"]}
+ignore = "0.4"
+rusqlite = {version = "0.40", features = ["bundled"]}
+serde = {version = "1", features = ["derive"]}
+serde_json = "1"
+shlex = "2"
+subst = "0.3"

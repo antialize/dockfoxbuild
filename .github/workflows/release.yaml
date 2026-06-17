@@ -1,0 +1,37 @@
+on:
+  push:
+    tags:
+      - 'v*'
+
+name: Release
+
+jobs:
+  build:
+    name: Build Linux Release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: strip target/release/dockfoxbuild
+      - run: zip --junk-paths dockfoxbuild-linux.zip target/release/dockfoxbuild
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dockfoxbuild-linux
+          path: dockfoxbuild-linux.zip
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-22.04
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dockfoxbuild-linux
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dockfoxbuild-linux.zip
