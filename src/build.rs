@@ -12,6 +12,7 @@ use crate::{
     dockerignore::load_gitignore,
     parse::parse_dockerfile,
     state::{Operation, OutOfBandWork, State},
+    substitute::substitute,
 };
 
 /// Kvp is a simple key-value pair struct used for parsing ARG and ENV instructions in the Dockerfile.
@@ -156,16 +157,27 @@ fn execute_env(line: &str, state: &mut State) -> Result<()> {
     Ok(())
 }
 
+fn hash_run(line: &str, args: &[(String, String)], hasher: &mut blake3::Hasher) {
+    hasher.update("\0RUN\0".as_bytes());
+    for (arg_key, arg_value) in args {
+        hasher.update(&[1]);
+        hasher.update(arg_key.as_bytes());
+        hasher.update("=".as_bytes());
+        hasher.update(arg_value.as_bytes());
+    }
+    hasher.update("\0".as_bytes());
+    hasher.update(line.as_bytes());
+}
+
 /// Execute a run instruction by invoking buildah run command with the appropriate arguments.
-pub fn execute_run(line: &str, state: &mut State) -> Result<()> {
+pub fn execute_run(line: &str, state: &mut State, args: &[(String, String)]) -> Result<()> {
     println!("\x1b[34mRUN {}\x1b[0m", line);
     let mut cmd = std::process::Command::new("buildah");
     cmd.arg("run");
     if let Some(network) = &state.network {
         cmd.args(["--network", network]);
     }
-    // Pass ARG values as environment variables so the shell can access them in RUN instructions.
-    for (key, value) in &state.stage.args {
+    for (key, value) in args {
         cmd.arg("--env");
         cmd.arg(format!("{}={}", key, value));
     }
@@ -442,6 +454,27 @@ fn execute_healthcheck(line: &str, state: &mut State) -> Result<()> {
     Ok(())
 }
 
+enum Preprocessed {
+    From(String),
+    Checkpoint(String),
+    Env(String),
+    Run {
+        line: String,
+        args: Vec<(String, String)>,
+    },
+    Workdir(String),
+    Copy(String),
+    Label(String),
+    Add(String),
+    User(String),
+    Entrypoint(String),
+    Cmd(String),
+    Expose(String),
+    Volume(String),
+    StopSignal(String),
+    HealthCheck(String),
+}
+
 /// Executes a chunk of Dockerfile instructions, which is a sequence of instructions starting with a FROM or CHECKPOINT instruction
 /// and ending before the next FROM or CHECKPOINT instruction.
 fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
@@ -454,7 +487,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
         for (op, line) in ops {
             match op {
                 Operation::Arg => {
-                    let line = crate::substitute::substitute(line, &state.global)?;
+                    let line = substitute(line, &state.global)?;
                     for part in shlex::split(&line).context("Invalid")? {
                         let kvp = part.parse::<Kvp>()?;
                         match state.global.args.entry(kvp.key) {
@@ -492,7 +525,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
                     .insert(cur_as, std::mem::take(&mut state.last_id));
             }
 
-            let line = crate::substitute::substitute(first_line, &state.global)?;
+            let line = substitute(first_line, &state.global)?;
             println!("\x1b[34mFROM {}\x1b[0m", line);
             let from = if let Some((from, as_)) = line.split_once(" AS ") {
                 state.cur_as = Some(as_.trim().to_string());
@@ -546,10 +579,10 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
                 hasher.update("\0FROM\0".as_bytes());
                 hasher.update(image.as_bytes());
             }
-            ppops.push((Operation::From, line));
+            ppops.push(Preprocessed::From(line));
         }
         Operation::Checkpoint => {
-            ppops.push((Operation::Checkpoint, first_line.clone()));
+            ppops.push(Preprocessed::Checkpoint(first_line.clone()));
         }
         _ => unreachable!("First instruction in chunk should be FROM or CHECKPOINT"),
     }
@@ -559,7 +592,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
     for (op, line) in ops {
         match op {
             Operation::Arg => {
-                let line = crate::substitute::substitute(line, &state.stage)?;
+                let line = substitute(line, &state.stage)?;
                 for part in shlex::split(&line).context("Invalid")? {
                     match part.parse::<Kvp>() {
                         Ok(kvp) => {
@@ -577,12 +610,12 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
                 // The arg instruction is now fully handled
             }
             Operation::Env => {
-                let line = crate::substitute::substitute(line, &state.stage)?;
+                let line = substitute(line, &state.stage)?;
                 for part in shlex::split(&line).context("Invalid")? {
                     let kvp: Kvp = part.parse()?;
                     state.stage.env.insert(kvp.key, kvp.value);
                 }
-                ppops.push((Operation::Env, line));
+                ppops.push(Preprocessed::Env(line));
             }
             Operation::From => {
                 unreachable!("FROM instruction should not be in the middle of a chunk");
@@ -590,22 +623,64 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
             Operation::Checkpoint => {
                 unreachable!("CHECKPOINT instruction should not be in the middle of a chunk");
             }
-            // RUN, CMD, ENTRYPOINT: variable substitution is handled by the shell, not the builder.
+            // RUN: variable substitution is handled by the shell, not the builder.
             // ARG values are automatically passed as environment variables to RUN by buildah.
-            Operation::Run | Operation::Entrypoint | Operation::Cmd => {
-                ppops.push((*op, line.to_string()));
+            Operation::Run => {
+                let mut args: Vec<_> = state
+                    .stage
+                    .args
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                args.sort();
+                ppops.push(Preprocessed::Run {
+                    line: line.to_string(),
+                    args,
+                });
             }
-            Operation::Workdir
-            | Operation::Copy
-            | Operation::Add
-            | Operation::Label
-            | Operation::User
-            | Operation::Expose
-            | Operation::Volume
-            | Operation::StopSignal
-            | Operation::HealthCheck => {
-                let line = crate::substitute::substitute(line, &state.stage)?;
-                ppops.push((*op, line));
+            // CMD and ENTRYPOINT are image metadata (runtime config), not build-time commands.
+            // Build args are not available at container runtime, so they are not passed here.
+            Operation::Entrypoint => {
+                ppops.push(Preprocessed::Entrypoint(line.to_string()));
+            }
+            Operation::Cmd => {
+                ppops.push(Preprocessed::Cmd(line.to_string()));
+            }
+            Operation::Workdir => {
+                let line = substitute(line, &state.stage)?;
+                ppops.push(Preprocessed::Workdir(line));
+            }
+            Operation::Copy => {
+                let line = substitute(line, &state.stage)?;
+                ppops.push(Preprocessed::Copy(line));
+            }
+            Operation::Add => {
+                let line = substitute(line, &state.stage)?;
+                ppops.push(Preprocessed::Add(line));
+            }
+            Operation::Label => {
+                let line = substitute(line, &state.stage)?;
+                ppops.push(Preprocessed::Label(line));
+            }
+            Operation::User => {
+                let line = substitute(line, &state.stage)?;
+                ppops.push(Preprocessed::User(line));
+            }
+            Operation::Expose => {
+                let line = substitute(line, &state.stage)?;
+                ppops.push(Preprocessed::Expose(line));
+            }
+            Operation::Volume => {
+                let line = substitute(line, &state.stage)?;
+                ppops.push(Preprocessed::Volume(line));
+            }
+            Operation::StopSignal => {
+                let line = substitute(line, &state.stage)?;
+                ppops.push(Preprocessed::StopSignal(line));
+            }
+            Operation::HealthCheck => {
+                let line = substitute(line, &state.stage)?;
+                ppops.push(Preprocessed::HealthCheck(line));
             }
         }
     }
@@ -615,94 +690,88 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
     // To work around this, we split the chunk into a head and main part,
     // where the head contains all instructions up to and including the last COPY instruction that cannot be hashed,
     // and the main contains the rest of the instructions
-    let last_copy = ppops.iter().rposition(|(op, line)| {
-        (*op == Operation::Copy && !copy_can_hash(line))
-            || (*op == Operation::Add && !add_can_hash(line))
+    let last_copy = ppops.iter().rposition(|ppop| {
+        matches!(ppop, Preprocessed::Copy(line) if !copy_can_hash(line))
+            || matches!(ppop, Preprocessed::Add(line) if !add_can_hash(line))
     });
     let (head, main) = if let Some(pos) = last_copy {
         ppops.split_at(pos + 1)
     } else {
-        (&[] as &[(Operation, String)], ppops.as_slice())
+        (&[] as &[Preprocessed], ppops.as_slice())
     };
 
     // Execute head while hashing, this ensures that we handle all instructions that
     // can affect the hash before we compute the hash and check the cache.
-    for (op, line) in head {
-        match op {
-            Operation::From => {
+    for ppop in head {
+        match ppop {
+            Preprocessed::From(line) => {
                 execute_from(line, state)?;
             }
-            Operation::Arg => {
-                unreachable!(
-                    "ARG instructions should not be in the head, they should have been handled in the first pass"
-                );
-            }
-            Operation::Env => {
+            Preprocessed::Env(line) => {
                 hasher.update("\0ENV\0".as_bytes());
                 hasher.update(line.as_bytes());
                 execute_env(line, state)?;
             }
-            Operation::Run => {
-                hasher.update("\0RUN\0".as_bytes());
-                hasher.update(line.as_bytes());
-                execute_run(line, state)?;
+            Preprocessed::Run { line, args } => {
+                hash_run(line, args, &mut hasher);
+                execute_run(line, state, args)?;
             }
-            Operation::Workdir => {
+            Preprocessed::Workdir(line) => {
                 hasher.update("\0WORKDIR\0".as_bytes());
                 hasher.update(line.as_bytes());
                 execute_workdir(line, state)?;
             }
-            Operation::Copy => {
+            Preprocessed::Copy(line) => {
                 hasher.update("\0COPY\0".as_bytes());
                 let content_hash = execute_copy(line, state)?;
                 hasher.update(content_hash.trim().as_bytes());
             }
-            Operation::Label => {
+            Preprocessed::Label(line) => {
                 hasher.update("\0LABEL\0".as_bytes());
                 hasher.update(line.as_bytes());
                 execute_label(line, state)?;
             }
-            Operation::Add => {
+            Preprocessed::Add(line) => {
                 hasher.update("\0ADD\0".as_bytes());
                 let content_hash = execute_add(line, state)?;
                 hasher.update(content_hash.trim().as_bytes());
             }
-            Operation::User => {
+            Preprocessed::User(line) => {
                 hasher.update("\0USER\0".as_bytes());
                 hasher.update(line.as_bytes());
                 execute_user(line, state)?;
             }
-            Operation::Entrypoint => {
+            Preprocessed::Entrypoint(line) => {
                 hasher.update("\0ENTRYPOINT\0".as_bytes());
                 hasher.update(line.as_bytes());
                 execute_entrypoint(line, state)?;
             }
-            Operation::Cmd => {
+            Preprocessed::Cmd(line) => {
                 hasher.update("\0CMD\0".as_bytes());
                 hasher.update(line.as_bytes());
                 execute_cmd(line, state)?;
             }
-            Operation::Expose => {
+            Preprocessed::Expose(line) => {
                 hasher.update("\0EXPOSE\0".as_bytes());
                 hasher.update(line.as_bytes());
                 execute_expose(line, state)?;
             }
-            Operation::Volume => {
+            Preprocessed::Volume(line) => {
                 hasher.update("\0VOLUME\0".as_bytes());
                 hasher.update(line.as_bytes());
                 execute_volume(line, state)?;
             }
-            Operation::StopSignal => {
+            Preprocessed::StopSignal(line) => {
                 hasher.update("\0STOPSIGNAL\0".as_bytes());
                 hasher.update(line.as_bytes());
                 execute_stopsignal(line, state)?;
             }
-            Operation::HealthCheck => {
+            Preprocessed::HealthCheck(line) => {
                 hasher.update("\0HEALTHCHECK\0".as_bytes());
                 hasher.update(line.as_bytes());
                 execute_healthcheck(line, state)?;
             }
-            Operation::Checkpoint => {
+            Preprocessed::Checkpoint(line) => {
                 execute_checkpoint(line, state)?;
             }
         }
@@ -710,62 +779,58 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
     }
 
     // Hash Remaining
-    for (op, line) in main {
+    for op in main {
         match op {
             // All ready handled
-            Operation::From | Operation::Checkpoint => {}
-            Operation::Arg => {
-                unreachable!("ARG instructions should not be in the second pass");
-            }
-            Operation::Env => {
+            Preprocessed::From(_) | Preprocessed::Checkpoint(_) => {}
+            Preprocessed::Env(line) => {
                 hasher.update("\0ENV\0".as_bytes());
                 hasher.update(line.as_bytes());
             }
-            Operation::Run => {
-                hasher.update("\0RUN\0".as_bytes());
-                hasher.update(line.as_bytes());
+            Preprocessed::Run { line, args } => {
+                hash_run(line, args, &mut hasher);
             }
-            Operation::Workdir => {
+            Preprocessed::Workdir(line) => {
                 hasher.update("\0WORKDIR\0".as_bytes());
                 hasher.update(line.as_bytes());
             }
-            Operation::Copy => {
+            Preprocessed::Copy(line) => {
                 hasher.update("\0COPY\0".as_bytes());
                 hash_sources(line, state, &mut hasher)?;
             }
-            Operation::Label => {
+            Preprocessed::Label(line) => {
                 hasher.update("\0LABEL\0".as_bytes());
                 hasher.update(line.as_bytes());
             }
-            Operation::Add => {
+            Preprocessed::Add(line) => {
                 hasher.update("\0ADD\0".as_bytes());
                 hash_sources(line, state, &mut hasher)?;
             }
-            Operation::User => {
+            Preprocessed::User(line) => {
                 hasher.update("\0USER\0".as_bytes());
                 hasher.update(line.as_bytes());
             }
-            Operation::Entrypoint => {
+            Preprocessed::Entrypoint(line) => {
                 hasher.update("\0ENTRYPOINT\0".as_bytes());
                 hasher.update(line.as_bytes());
             }
-            Operation::Cmd => {
+            Preprocessed::Cmd(line) => {
                 hasher.update("\0CMD\0".as_bytes());
                 hasher.update(line.as_bytes());
             }
-            Operation::Expose => {
+            Preprocessed::Expose(line) => {
                 hasher.update("\0EXPOSE\0".as_bytes());
                 hasher.update(line.as_bytes());
             }
-            Operation::Volume => {
+            Preprocessed::Volume(line) => {
                 hasher.update("\0VOLUME\0".as_bytes());
                 hasher.update(line.as_bytes());
             }
-            Operation::StopSignal => {
+            Preprocessed::StopSignal(line) => {
                 hasher.update("\0STOPSIGNAL\0".as_bytes());
                 hasher.update(line.as_bytes());
             }
-            Operation::HealthCheck => {
+            Preprocessed::HealthCheck(line) => {
                 hasher.update("\0HEALTHCHECK\0".as_bytes());
                 hasher.update(line.as_bytes());
             }
@@ -862,24 +927,23 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
             state.container = None;
         }
 
-        for (op, line) in main {
+        for op in main {
             match op {
-                Operation::From => (),
-                Operation::Arg => println!("\x1b[32mARG {}\x1b[0m", line),
-                Operation::Env => println!("\x1b[32mENV {}\x1b[0m", line),
-                Operation::Run => println!("\x1b[32mRUN {}\x1b[0m", line),
-                Operation::Workdir => println!("\x1b[32mWORKDIR {}\x1b[0m", line),
-                Operation::Copy => println!("\x1b[32mCOPY {}\x1b[0m", line),
-                Operation::Add => println!("\x1b[32mADD {}\x1b[0m", line),
-                Operation::Label => println!("\x1b[32mLABEL {}\x1b[0m", line),
-                Operation::User => println!("\x1b[32mUSER {}\x1b[0m", line),
-                Operation::Entrypoint => println!("\x1b[32mENTRYPOINT {}\x1b[0m", line),
-                Operation::Cmd => println!("\x1b[32mCMD {}\x1b[0m", line),
-                Operation::Expose => println!("\x1b[32mEXPOSE {}\x1b[0m", line),
-                Operation::Volume => println!("\x1b[32mVOLUME {}\x1b[0m", line),
-                Operation::StopSignal => println!("\x1b[32mSTOPSIGNAL {}\x1b[0m", line),
-                Operation::HealthCheck => println!("\x1b[32mHEALTHCHECK {}\x1b[0m", line),
-                Operation::Checkpoint => println!("\x1b[32mCHECKPOINT {}\x1b[0m", line),
+                Preprocessed::From(_) => (),
+                Preprocessed::Env(line) => println!("\x1b[32mENV {}\x1b[0m", line),
+                Preprocessed::Run { line, .. } => println!("\x1b[32mRUN {}\x1b[0m", line),
+                Preprocessed::Workdir(line) => println!("\x1b[32mWORKDIR {}\x1b[0m", line),
+                Preprocessed::Copy(line) => println!("\x1b[32mCOPY {}\x1b[0m", line),
+                Preprocessed::Add(line) => println!("\x1b[32mADD {}\x1b[0m", line),
+                Preprocessed::Label(line) => println!("\x1b[32mLABEL {}\x1b[0m", line),
+                Preprocessed::User(line) => println!("\x1b[32mUSER {}\x1b[0m", line),
+                Preprocessed::Entrypoint(line) => println!("\x1b[32mENTRYPOINT {}\x1b[0m", line),
+                Preprocessed::Cmd(line) => println!("\x1b[32mCMD {}\x1b[0m", line),
+                Preprocessed::Expose(line) => println!("\x1b[32mEXPOSE {}\x1b[0m", line),
+                Preprocessed::Volume(line) => println!("\x1b[32mVOLUME {}\x1b[0m", line),
+                Preprocessed::StopSignal(line) => println!("\x1b[32mSTOPSIGNAL {}\x1b[0m", line),
+                Preprocessed::HealthCheck(line) => println!("\x1b[32mHEALTHCHECK {}\x1b[0m", line),
+                Preprocessed::Checkpoint(line) => println!("\x1b[32mCHECKPOINT {}\x1b[0m", line),
             };
         }
         handle_oob_ret(&mut state.oob_ret_rx);
@@ -888,56 +952,51 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
     }
 
     // If there is a cache miss, we execute the remaining instructions as normal.
-    for (op, line) in main {
+    for op in main {
         match op {
-            Operation::From => {
+            Preprocessed::From(line) => {
                 execute_from(line, state)?;
             }
-            Operation::Arg => {
-                unreachable!(
-                    "ARG instructions should not be in the head, they should have been handled in the first pass"
-                );
-            }
-            Operation::Env => {
+            Preprocessed::Env(line) => {
                 execute_env(line, state)?;
             }
-            Operation::Run => {
-                execute_run(line, state)?;
+            Preprocessed::Run { line, args } => {
+                execute_run(line, state, args)?;
             }
-            Operation::Workdir => {
+            Preprocessed::Workdir(line) => {
                 execute_workdir(line, state)?;
             }
-            Operation::Copy => {
+            Preprocessed::Copy(line) => {
                 execute_copy(line, state)?;
             }
-            Operation::Add => {
+            Preprocessed::Add(line) => {
                 execute_add(line, state)?;
             }
-            Operation::Label => {
+            Preprocessed::Label(line) => {
                 execute_label(line, state)?;
             }
-            Operation::User => {
+            Preprocessed::User(line) => {
                 execute_user(line, state)?;
             }
-            Operation::Entrypoint => {
+            Preprocessed::Entrypoint(line) => {
                 execute_entrypoint(line, state)?;
             }
-            Operation::Cmd => {
+            Preprocessed::Cmd(line) => {
                 execute_cmd(line, state)?;
             }
-            Operation::Expose => {
+            Preprocessed::Expose(line) => {
                 execute_expose(line, state)?;
             }
-            Operation::Volume => {
+            Preprocessed::Volume(line) => {
                 execute_volume(line, state)?;
             }
-            Operation::StopSignal => {
+            Preprocessed::StopSignal(line) => {
                 execute_stopsignal(line, state)?;
             }
-            Operation::HealthCheck => {
+            Preprocessed::HealthCheck(line) => {
                 execute_healthcheck(line, state)?;
             }
-            Operation::Checkpoint => {
+            Preprocessed::Checkpoint(line) => {
                 execute_checkpoint(line, state)?;
             }
         }
