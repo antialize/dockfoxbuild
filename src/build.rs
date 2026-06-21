@@ -77,6 +77,10 @@ pub struct BuildArgs {
     ///// Push cache to these images, e.g. "localhost:5000/myimage:tag"
     #[clap(long)]
     cache_to: Option<String>,
+
+    /// Set the network mode for RUN instructions, e.g. "none", "host", or "container:<id>".
+    #[clap(long)]
+    network: Option<String>,
 }
 
 /// Execute from instruction by creating a new container from the specified image and setting it as the current container in the build state.
@@ -155,17 +159,18 @@ fn execute_env(line: &str, state: &mut State) -> Result<()> {
 /// Execute a run instruction by invoking buildah run command with the appropriate arguments.
 pub fn execute_run(line: &str, state: &mut State) -> Result<()> {
     println!("\x1b[34mRUN {}\x1b[0m", line);
-    let out = std::process::Command::new("buildah")
-        .args([
-            "run",
-            state.container.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("RUN instruction must be used after a FROM instruction")
-            })?,
-            "--",
-            "sh",
-            "-c",
-            line,
-        ])
+    let mut cmd = std::process::Command::new("buildah");
+    cmd.arg("run");
+    if let Some(network) = &state.network {
+        cmd.args(["--network", network]);
+    }
+    cmd.arg(
+        state.container.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("RUN instruction must be used after a FROM instruction")
+        })?,
+    );
+    cmd.args(["--", "sh", "-c", line]);
+    let out = cmd
         .status()
         .with_context(|| format!("Failed to run command: {}", line))?;
     if !out.success() {
@@ -1067,6 +1072,7 @@ pub fn build_command(args: BuildArgs) -> Result<()> {
         cache_to: args.cache_to.is_some(),
         cache_from: args.cache_from.clone(),
         format: args.format,
+        network: args.network,
     };
 
     for (key, value) in std::env::vars() {

@@ -97,4 +97,6 @@ pub struct State {
     pub cache_from: Option<String>,
     /// The output format for the built image, if specified (e.g., "oci", "docker").
     pub format: Option<String>,
+    /// The network mode for RUN instructions, if specified.
+    pub network: Option<String>,
 }
