@@ -20,18 +20,26 @@ pub fn parse_dockerfile(path: &Path) -> Result<Vec<(Operation, String)>> {
         }
         let line = if let Some(line) = line.strip_suffix('\\') {
             let mut full = line.trim().to_string();
+            let mut need_continuation = false; // previous non-comment line had trailing \
             loop {
                 let line = lines
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("Unexpected end of file while parsing line"))?;
                 if line.trim_start().starts_with('#') {
+                    // Only skip comments that appear mid-continuation (i.e. after a line with \).
+                    // If we already consumed the final continuation line (no trailing \),
+                    // a comment should not pull in further lines.
+                    if need_continuation {
+                        break;
+                    }
                     continue;
                 }
                 if let Some(line) = line.strip_suffix('\\') {
-                    full.push('\n');
+                    full.push(' ');
                     full.push_str(line.trim());
+                    need_continuation = false;
                 } else {
-                    full.push('\n');
+                    full.push(' ');
                     full.push_str(line.trim());
                     break;
                 }

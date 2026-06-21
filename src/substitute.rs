@@ -57,7 +57,7 @@ pub fn substitute(s: &str, vars: &VarMap) -> Result<String> {
                         out.push_str(vars.get(&inner));
                     }
                 }
-                Some((_, c)) if c.is_ascii_alphanumeric() || *c == '_' => {
+                Some((_, c)) if c.is_ascii_alphabetic() || *c == '_' => {
                     let mut name = String::new();
                     while let Some((_, c)) = chars.peek() {
                         if c.is_ascii_alphanumeric() || *c == '_' {
@@ -150,6 +150,13 @@ mod tests {
         let v = vars(&[]);
         // \n and \\ should be passed through unchanged
         assert_eq!(substitute(r"printf '%s\n'", &v).unwrap(), r"printf '%s\n'");
+    }
+
+    #[test]
+    fn test_positional_dollar_passthrough() {
+        // $0, $1 etc. are not valid Dockerfile variable names and must pass through unchanged
+        let v = vars(&[]);
+        assert_eq!(substitute("awk '$0 == x'", &v).unwrap(), "awk '$0 == x'");
     }
 
     #[test]

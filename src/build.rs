@@ -164,6 +164,11 @@ pub fn execute_run(line: &str, state: &mut State) -> Result<()> {
     if let Some(network) = &state.network {
         cmd.args(["--network", network]);
     }
+    // Pass ARG values as environment variables so the shell can access them in RUN instructions.
+    for (key, value) in &state.stage.args {
+        cmd.arg("--env");
+        cmd.arg(format!("{}={}", key, value));
+    }
     cmd.arg(
         state.container.as_ref().ok_or_else(|| {
             anyhow::anyhow!("RUN instruction must be used after a FROM instruction")
@@ -585,14 +590,16 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
             Operation::Checkpoint => {
                 unreachable!("CHECKPOINT instruction should not be in the middle of a chunk");
             }
-            Operation::Run
-            | Operation::Workdir
+            // RUN, CMD, ENTRYPOINT: variable substitution is handled by the shell, not the builder.
+            // ARG values are automatically passed as environment variables to RUN by buildah.
+            Operation::Run | Operation::Entrypoint | Operation::Cmd => {
+                ppops.push((*op, line.to_string()));
+            }
+            Operation::Workdir
             | Operation::Copy
             | Operation::Add
             | Operation::Label
             | Operation::User
-            | Operation::Entrypoint
-            | Operation::Cmd
             | Operation::Expose
             | Operation::Volume
             | Operation::StopSignal
