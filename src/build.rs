@@ -489,13 +489,14 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
                 Operation::Arg => {
                     let line = substitute(line, &state.global)?;
                     for part in shlex::split(&line).context("Invalid")? {
-                        let kvp = part.parse::<Kvp>()?;
-                        match state.global.args.entry(kvp.key) {
-                            std::collections::hash_map::Entry::Occupied(_) => {
+                        match part.parse::<Kvp>() {
+                            Ok(kvp) => {
                                 // ARG before the first FROM only provides default values for build args
+                                state.global.args.entry(kvp.key).or_insert(kvp.value);
                             }
-                            std::collections::hash_map::Entry::Vacant(e) => {
-                                e.insert(kvp.value);
+                            Err(_) => {
+                                // Bare ARG name with no default - inherit from --build-arg if provided, else empty string
+                                state.global.args.entry(part).or_default();
                             }
                         }
                     }
