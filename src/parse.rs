@@ -24,10 +24,14 @@ pub fn parse_dockerfile(path: &Path) -> Result<Vec<(Operation, String)>> {
                 let line = lines
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("Unexpected end of file while parsing line"))?;
+                if line.trim_start().starts_with('#') {
+                    continue;
+                }
                 if let Some(line) = line.strip_suffix('\\') {
                     full.push('\n');
                     full.push_str(line.trim());
                 } else {
+                    full.push('\n');
                     full.push_str(line.trim());
                     break;
                 }
