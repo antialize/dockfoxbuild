@@ -13,6 +13,7 @@ mod pull;
 mod push;
 mod size;
 mod state;
+mod substitute;
 
 #[derive(clap::Subcommand)]
 enum Commands {

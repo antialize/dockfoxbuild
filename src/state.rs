@@ -13,16 +13,14 @@ pub struct VarMap {
     pub env: HashMap<String, String>,
 }
 
-impl<'a> subst::VariableMap<'a> for VarMap {
-    type Value = &'a str;
-
-    fn get(&'a self, key: &str) -> Option<&'a str> {
+impl VarMap {
+    pub fn get(&self, key: &str) -> &str {
         if let Some(val) = self.env.get(key) {
-            Some(val.as_str())
+            val.as_str()
         } else if let Some(val) = self.args.get(key) {
-            Some(val.as_str())
+            val.as_str()
         } else {
-            None
+            ""
         }
     }
 }

@@ -449,7 +449,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
         for (op, line) in ops {
             match op {
                 Operation::Arg => {
-                    let line = subst::substitute(line, &state.global)?;
+                    let line = crate::substitute::substitute(line, &state.global)?;
                     for part in shlex::split(&line).context("Invalid")? {
                         let kvp = part.parse::<Kvp>()?;
                         match state.global.args.entry(kvp.key) {
@@ -487,7 +487,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
                     .insert(cur_as, std::mem::take(&mut state.last_id));
             }
 
-            let line = subst::substitute(first_line, &state.global)?;
+            let line = crate::substitute::substitute(first_line, &state.global)?;
             println!("\x1b[34mFROM {}\x1b[0m", line);
             let from = if let Some((from, as_)) = line.split_once(" AS ") {
                 state.cur_as = Some(as_.trim().to_string());
@@ -554,7 +554,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
     for (op, line) in ops {
         match op {
             Operation::Arg => {
-                let line = subst::substitute(line, &state.stage)?;
+                let line = crate::substitute::substitute(line, &state.stage)?;
                 for part in shlex::split(&line).context("Invalid")? {
                     match part.parse::<Kvp>() {
                         Ok(kvp) => {
@@ -572,7 +572,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
                 // The arg instruction is now fully handled
             }
             Operation::Env => {
-                let line = subst::substitute(line, &state.stage)?;
+                let line = crate::substitute::substitute(line, &state.stage)?;
                 for part in shlex::split(&line).context("Invalid")? {
                     let kvp: Kvp = part.parse()?;
                     state.stage.env.insert(kvp.key, kvp.value);
@@ -597,7 +597,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
             | Operation::Volume
             | Operation::StopSignal
             | Operation::HealthCheck => {
-                let line = subst::substitute(line, &state.stage)?;
+                let line = crate::substitute::substitute(line, &state.stage)?;
                 ppops.push((*op, line));
             }
         }
