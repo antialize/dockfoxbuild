@@ -17,7 +17,7 @@ pub struct PruneArgs {
     /// Maximum cache size (e.g. "100GB", "512MB"). Older images are pruned to maintain this limit.
     #[arg(long, default_value = "100GB")]
     max_cache_size: Size,
-    /// If set, the prune command will run in quiet mode and only output summary information.
+    /// If set, only output on error (suitable for cron jobs).
     #[arg(long, short)]
     quiet: bool,
 }
@@ -76,7 +76,11 @@ pub fn prune(args: PruneArgs) -> Result<()> {
     // `buildah ps` can hang if buildah/podman is in a bad state, so enforce a timeout.
     let mut child = std::process::Command::new("buildah")
         .args(["ps", "--json"])
-        .stderr(Stdio::inherit())
+        .stderr(if args.quiet {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        })
         .stdout(Stdio::piped())
         .spawn()?;
     // Read stdout in a thread so it doesn't block the pipe buffer while we poll.
@@ -115,7 +119,11 @@ pub fn prune(args: PruneArgs) -> Result<()> {
         // Inspect container to get creation time
         let output = std::process::Command::new("buildah")
             .args(["inspect", &container.id])
-            .stderr(Stdio::inherit())
+            .stderr(if args.quiet {
+                Stdio::null()
+            } else {
+                Stdio::inherit()
+            })
             .output()?;
         if !output.status.success() {
             bail!(
@@ -133,10 +141,16 @@ pub fn prune(args: PruneArgs) -> Result<()> {
             continue;
         }
 
-        println!("Pruning container {} (age: {})", container.id, age);
+        if !args.quiet {
+            println!("Pruning container {} (age: {})", container.id, age);
+        }
         let status = std::process::Command::new("buildah")
             .args(["rm", &container.id])
-            .stderr(Stdio::inherit())
+            .stderr(if args.quiet {
+                Stdio::null()
+            } else {
+                Stdio::inherit()
+            })
             .status()?;
         if !status.success() {
             bail!("Failed to remove container {}: {}", container.id, status);
@@ -146,7 +160,11 @@ pub fn prune(args: PruneArgs) -> Result<()> {
     // List images known by buildah
     let output = std::process::Command::new("buildah")
         .args(["images", "--no-trunc", "--json"])
-        .stderr(Stdio::inherit())
+        .stderr(if args.quiet {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        })
         .output()?;
     if !output.status.success() {
         bail!("Failed to list images: {}", output.status);
