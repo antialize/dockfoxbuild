@@ -73,15 +73,39 @@ struct ImageInfo2 {
 /// Prune old buildah images and containers based on age and cache size limits.
 pub fn prune(args: PruneArgs) -> Result<()> {
     // Find and kill stray containers
-    let output = std::process::Command::new("buildah")
+    // `buildah ps` can hang if buildah/podman is in a bad state, so enforce a timeout.
+    let mut child = std::process::Command::new("buildah")
         .args(["ps", "--json"])
         .stderr(Stdio::inherit())
-        .output()?;
-    if !output.status.success() {
-        bail!("Failed to list containers: {}", output.status);
+        .stdout(Stdio::piped())
+        .spawn()?;
+    // Read stdout in a thread so it doesn't block the pipe buffer while we poll.
+    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+    let (tx, rx) = crossbeam::channel::bounded::<std::io::Result<Vec<u8>>>(1);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = tx.send(stdout_pipe.read_to_end(&mut buf).map(|_| buf));
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let status = loop {
+        match child.try_wait().context("Waiting for buildah ps")? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                bail!("buildah ps timed out after 30s");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    };
+    if !status.success() {
+        bail!("Failed to list containers: {}", status);
     }
+    let stdout = rx.recv().unwrap().context("Reading buildah ps output")?;
     let containers: Vec<ContainerPsInfo> =
-        serde_json::from_slice(&output.stdout).context("Listing containers")?;
+        serde_json::from_slice::<Option<Vec<ContainerPsInfo>>>(&stdout)
+            .context("Listing containers")?
+            .unwrap_or_default();
 
     for container in containers {
         if !container.builder {
@@ -127,8 +151,9 @@ pub fn prune(args: PruneArgs) -> Result<()> {
     if !output.status.success() {
         bail!("Failed to list images: {}", output.status);
     }
-    let images: Vec<ImageInfo> =
-        serde_json::from_slice(&output.stdout).context("Listing images")?;
+    let images: Vec<ImageInfo> = serde_json::from_slice::<Option<Vec<ImageInfo>>>(&output.stdout)
+        .context("Listing images")?
+        .unwrap_or_default();
     let mut images_by_id = HashMap::new();
     for image in images {
         let time = chrono::DateTime::parse_from_rfc3339(&image.createdatraw)
