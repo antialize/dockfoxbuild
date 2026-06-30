@@ -273,7 +273,14 @@ fn execute_entrypoint(line: &str, state: &mut State) -> Result<()> {
             .context("Failed to serialize ENTRYPOINT")?
     };
     let out = std::process::Command::new("buildah")
-        .args(["config", "--entrypoint", &entrypoint, container])
+        .args([
+            "config",
+            "--entrypoint",
+            &entrypoint,
+            "--cmd",
+            "[]",
+            container,
+        ])
         .status()
         .with_context(|| format!("Failed to set entrypoint: {}", line))?;
     if !out.success() {
