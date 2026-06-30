@@ -82,6 +82,10 @@ pub struct BuildArgs {
     /// Set the network mode for RUN instructions, e.g. "none", "host", or "container:<id>".
     #[clap(long)]
     network: Option<String>,
+
+    /// Print each hash input and running hash for debugging cache misses.
+    #[clap(long)]
+    debug_hash: bool,
 }
 
 /// Execute from instruction by creating a new container from the specified image and setting it as the current container in the build state.
@@ -482,6 +486,28 @@ enum Preprocessed {
     HealthCheck(String),
 }
 
+fn debug_hash_print(enabled: bool, tag: &str, text: &str) {
+    if !enabled {
+        return;
+    }
+    // Visible prefix is "HASH {tag}: " = 7 + tag.len() chars.
+    // Keep the total visible line under 120 characters.
+    let available = 120usize.saturating_sub(7 + tag.len());
+    if text.len() <= available {
+        println!("\x1b[33mHASH {tag}:\x1b[0m {text}");
+    } else {
+        // "... (xxxxxxxx)" takes 14 characters, leaving the rest for the text prefix.
+        let truncate_at = available.saturating_sub(14);
+        let prefix: String = text.chars().take(truncate_at).collect();
+        let hash = blake3::hash(text.as_bytes());
+        println!(
+            "\x1b[33mHASH {tag}:\x1b[0m {}... ({})",
+            prefix,
+            &hash.to_hex()[..8]
+        );
+    }
+}
+
 /// Executes a chunk of Dockerfile instructions, which is a sequence of instructions starting with a FROM or CHECKPOINT instruction
 /// and ending before the next FROM or CHECKPOINT instruction.
 fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
@@ -544,6 +570,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
 
             if from == "scratch" {
                 hasher.update("\0FROM\0scratch\0".as_bytes());
+                debug_hash_print(state.debug_hash, "FROM", "scratch");
             } else {
                 let image = match state.as_images.get(from) {
                     Some(image) => image.clone(),
@@ -586,6 +613,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
                 }
                 hasher.update("\0FROM\0".as_bytes());
                 hasher.update(image.as_bytes());
+                debug_hash_print(state.debug_hash, "FROM", &image);
             }
             ppops.push(Preprocessed::From(line));
         }
@@ -718,65 +746,78 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
             Preprocessed::Env(line) => {
                 hasher.update("\0ENV\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "ENV", line);
                 execute_env(line, state)?;
             }
             Preprocessed::Run { line, args } => {
                 hash_run(line, args, &mut hasher);
+                debug_hash_print(state.debug_hash, "RUN", line);
                 execute_run(line, state, args)?;
             }
             Preprocessed::Workdir(line) => {
                 hasher.update("\0WORKDIR\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "WORKDIR", line);
                 execute_workdir(line, state)?;
             }
             Preprocessed::Copy(line) => {
                 hasher.update("\0COPY\0".as_bytes());
                 let content_hash = execute_copy(line, state)?;
                 hasher.update(content_hash.trim().as_bytes());
+                debug_hash_print(state.debug_hash, "COPY", line);
             }
             Preprocessed::Label(line) => {
                 hasher.update("\0LABEL\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "LABEL", line);
                 execute_label(line, state)?;
             }
             Preprocessed::Add(line) => {
                 hasher.update("\0ADD\0".as_bytes());
                 let content_hash = execute_add(line, state)?;
                 hasher.update(content_hash.trim().as_bytes());
+                debug_hash_print(state.debug_hash, "ADD", line);
             }
             Preprocessed::User(line) => {
                 hasher.update("\0USER\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "USER", line);
                 execute_user(line, state)?;
             }
             Preprocessed::Entrypoint(line) => {
                 hasher.update("\0ENTRYPOINT\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "ENTRYPOINT", line);
                 execute_entrypoint(line, state)?;
             }
             Preprocessed::Cmd(line) => {
                 hasher.update("\0CMD\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "CMD", line);
                 execute_cmd(line, state)?;
             }
             Preprocessed::Expose(line) => {
                 hasher.update("\0EXPOSE\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "EXPOSE", line);
                 execute_expose(line, state)?;
             }
             Preprocessed::Volume(line) => {
                 hasher.update("\0VOLUME\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "VOLUME", line);
                 execute_volume(line, state)?;
             }
             Preprocessed::StopSignal(line) => {
                 hasher.update("\0STOPSIGNAL\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "STOPSIGNAL", line);
                 execute_stopsignal(line, state)?;
             }
             Preprocessed::HealthCheck(line) => {
                 hasher.update("\0HEALTHCHECK\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "HEALTHCHECK", line);
                 execute_healthcheck(line, state)?;
             }
             Preprocessed::Checkpoint(line) => {
@@ -794,53 +835,66 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
             Preprocessed::Env(line) => {
                 hasher.update("\0ENV\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "ENV", line);
             }
             Preprocessed::Run { line, args } => {
                 hash_run(line, args, &mut hasher);
+                debug_hash_print(state.debug_hash, "RUN", line);
             }
             Preprocessed::Workdir(line) => {
                 hasher.update("\0WORKDIR\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "WORKDIR", line);
             }
             Preprocessed::Copy(line) => {
                 hasher.update("\0COPY\0".as_bytes());
                 hash_sources(line, state, &mut hasher)?;
+                debug_hash_print(state.debug_hash, "COPY", line);
             }
             Preprocessed::Label(line) => {
                 hasher.update("\0LABEL\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "LABEL", line);
             }
             Preprocessed::Add(line) => {
                 hasher.update("\0ADD\0".as_bytes());
                 hash_sources(line, state, &mut hasher)?;
+                debug_hash_print(state.debug_hash, "ADD", line);
             }
             Preprocessed::User(line) => {
                 hasher.update("\0USER\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "USER", line);
             }
             Preprocessed::Entrypoint(line) => {
                 hasher.update("\0ENTRYPOINT\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "ENTRYPOINT", line);
             }
             Preprocessed::Cmd(line) => {
                 hasher.update("\0CMD\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "CMD", line);
             }
             Preprocessed::Expose(line) => {
                 hasher.update("\0EXPOSE\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "EXPOSE", line);
             }
             Preprocessed::Volume(line) => {
                 hasher.update("\0VOLUME\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "VOLUME", line);
             }
             Preprocessed::StopSignal(line) => {
                 hasher.update("\0STOPSIGNAL\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "STOPSIGNAL", line);
             }
             Preprocessed::HealthCheck(line) => {
                 hasher.update("\0HEALTHCHECK\0".as_bytes());
                 hasher.update(line.as_bytes());
+                debug_hash_print(state.debug_hash, "HEALTHCHECK", line);
             }
         }
         handle_oob_ret(&mut state.oob_ret_rx);
@@ -848,6 +902,9 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
 
     // After hashing, we can check the cache and execute the remaining instructions if there is a cache miss, or skip them if there is a cache hit.
     let chunk_hash = hasher.finalize().to_hex().to_string();
+    if state.debug_hash {
+        println!("\x1b[33mHASH chunk:\x1b[0m {}", chunk_hash);
+    }
     // When --no-cache is set we do not consult any cache (local or remote), so we
     // start from a forced cache miss and skip all of the lookup logic below.
     let mut image = if state.no_cache {
@@ -1147,6 +1204,7 @@ pub fn build_command(args: BuildArgs) -> Result<()> {
         cache_from: args.cache_from.clone(),
         format: args.format,
         network: args.network,
+        debug_hash: args.debug_hash,
     };
 
     for (key, value) in std::env::vars() {
