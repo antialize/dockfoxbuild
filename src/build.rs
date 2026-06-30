@@ -575,8 +575,20 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
                 let image = match state.as_images.get(from) {
                     Some(image) => image.clone(),
                     None => {
+                        // `--policy always` is required for cache correctness:
+                        // buildah's default pull policy is `missing`, which
+                        // returns a locally-cached image *without* contacting
+                        // the registry when an image with this tag already
+                        // exists in local storage. A mutable tag (e.g. a CI
+                        // `:ci_<branch>` tag) can then resolve to a stale image
+                        // ID left over from a previous build on this host. That
+                        // stale ID feeds into the chunk hash below, so a
+                        // genuinely new base image would collide with a prior
+                        // build's hash and produce a false cache hit. Always
+                        // re-resolving the tag against the registry keeps the
+                        // FROM hash tied to the base image's real content.
                         let out = std::process::Command::new("buildah")
-                            .args(["pull", from])
+                            .args(["pull", "--policy", "always", from])
                             .stderr(Stdio::inherit())
                             .output()
                             .with_context(|| format!("Failed to pull image: {}", from))?;
