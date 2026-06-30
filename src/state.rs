@@ -97,4 +97,6 @@ pub struct State {
     pub format: Option<String>,
     /// The network mode for RUN instructions, if specified.
     pub network: Option<String>,
+    /// Debug hash
+    pub debug_hash: bool,
 }

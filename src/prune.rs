@@ -70,6 +70,23 @@ struct ImageInfo2 {
     checkpoints: Vec<String>,
 }
 
+/// Run a command, always capturing stdout. In quiet mode, captures stderr and prints it to
+/// stderr on failure. In non-quiet mode, streams stderr directly to the terminal.
+fn run_command(cmd: &mut std::process::Command, quiet: bool) -> Result<std::process::Output> {
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(if quiet {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+        .output()?;
+    if quiet && !output.status.success() && !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(output)
+}
+
 /// Prune old buildah images and containers based on age and cache size limits.
 pub fn prune(args: PruneArgs) -> Result<()> {
     // Find and kill stray containers
@@ -77,12 +94,24 @@ pub fn prune(args: PruneArgs) -> Result<()> {
     let mut child = std::process::Command::new("buildah")
         .args(["ps", "--json"])
         .stderr(if args.quiet {
-            Stdio::null()
+            Stdio::piped()
         } else {
             Stdio::inherit()
         })
         .stdout(Stdio::piped())
         .spawn()?;
+    // Drain stderr in a thread so it doesn't block the pipe buffer while we poll.
+    let stderr_rx = args.quiet.then(|| {
+        let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+        let (tx, rx) = crossbeam::channel::bounded::<Vec<u8>>(1);
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+        rx
+    });
     // Read stdout in a thread so it doesn't block the pipe buffer while we poll.
     let mut stdout_pipe = child.stdout.take().expect("stdout piped");
     let (tx, rx) = crossbeam::channel::bounded::<std::io::Result<Vec<u8>>>(1);
@@ -103,6 +132,12 @@ pub fn prune(args: PruneArgs) -> Result<()> {
         }
     };
     if !status.success() {
+        if let Some(stderr_rx) = stderr_rx
+            && let Ok(buf) = stderr_rx.recv()
+            && !buf.is_empty()
+        {
+            eprint!("{}", String::from_utf8_lossy(&buf));
+        }
         bail!("Failed to list containers: {}", status);
     }
     let stdout = rx.recv().unwrap().context("Reading buildah ps output")?;
@@ -117,14 +152,10 @@ pub fn prune(args: PruneArgs) -> Result<()> {
         }
 
         // Inspect container to get creation time
-        let output = std::process::Command::new("buildah")
-            .args(["inspect", &container.id])
-            .stderr(if args.quiet {
-                Stdio::null()
-            } else {
-                Stdio::inherit()
-            })
-            .output()?;
+        let output = run_command(
+            std::process::Command::new("buildah").args(["inspect", &container.id]),
+            args.quiet,
+        )?;
         if !output.status.success() {
             bail!(
                 "Failed to inspect container {}: {}",
@@ -144,28 +175,24 @@ pub fn prune(args: PruneArgs) -> Result<()> {
         if !args.quiet {
             println!("Pruning container {} (age: {})", container.id, age);
         }
-        let status = std::process::Command::new("buildah")
-            .args(["rm", &container.id])
-            .stderr(if args.quiet {
-                Stdio::null()
-            } else {
-                Stdio::inherit()
-            })
-            .status()?;
-        if !status.success() {
-            bail!("Failed to remove container {}: {}", container.id, status);
+        let output = run_command(
+            std::process::Command::new("buildah").args(["rm", &container.id]),
+            args.quiet,
+        )?;
+        if !output.status.success() {
+            bail!(
+                "Failed to remove container {}: {}",
+                container.id,
+                output.status
+            );
         }
     }
 
     // List images known by buildah
-    let output = std::process::Command::new("buildah")
-        .args(["images", "--no-trunc", "--json"])
-        .stderr(if args.quiet {
-            Stdio::null()
-        } else {
-            Stdio::inherit()
-        })
-        .output()?;
+    let output = run_command(
+        std::process::Command::new("buildah").args(["images", "--no-trunc", "--json"]),
+        args.quiet,
+    )?;
     if !output.status.success() {
         bail!("Failed to list images: {}", output.status);
     }
@@ -266,13 +293,12 @@ pub fn prune(args: PruneArgs) -> Result<()> {
             bt = info.time;
             break;
         }
-        let s = std::process::Command::new("buildah")
-            .args(["rmi", &info.id])
-            .stderr(Stdio::null())
-            .stdout(Stdio::null())
-            .status()
-            .with_context(|| format!("Failed to remove image {}", info.id))?;
-        if s.success() {
+        let output = run_command(
+            std::process::Command::new("buildah").args(["rmi", &info.id]),
+            args.quiet,
+        )
+        .with_context(|| format!("Failed to remove image {}", info.id))?;
+        if output.status.success() {
             freed += info.size;
             removed_count += 1;
         } else {

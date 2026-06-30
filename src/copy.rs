@@ -90,7 +90,7 @@ pub fn hash_sources(line: &str, state: &mut State, hasher: &mut blake3::Hasher) 
     }
 
     let walker = builder.build_parallel();
-
+    let debug_hash = state.debug_hash;
     walker.run(|| {
         let tx = tx.clone();
         let matcher = &state.ignore;
@@ -130,7 +130,16 @@ pub fn hash_sources(line: &str, state: &mut State, hasher: &mut blake3::Hasher) 
                 hasher.update(relative_path.as_os_str().as_bytes());
                 hasher.update(&[1]);
                 hasher.update(target.as_os_str().as_bytes());
-                tx.send(hasher.finalize().into()).unwrap();
+                let hash = hasher.finalize();
+                if debug_hash {
+                    println!(
+                        "\x1b[33mHASH symlink:\x1b[0m {} -> {} -> {}",
+                        relative_path.display(),
+                        target.display(),
+                        hash.to_hex()
+                    );
+                }
+                tx.send(hash.into()).unwrap();
                 return WalkState::Continue;
             }
 
@@ -160,7 +169,15 @@ pub fn hash_sources(line: &str, state: &mut State, hasher: &mut blake3::Hasher) 
                         }
                     }
                 }
-                tx.send(hasher.finalize().into()).unwrap();
+                let hash = hasher.finalize();
+                if debug_hash {
+                    println!(
+                        "\x1b[33mHASH file:\x1b[0m {} -> {}",
+                        relative_path.display(),
+                        hash.to_hex()
+                    );
+                }
+                tx.send(hash.into()).unwrap();
             }
             WalkState::Continue
         })
