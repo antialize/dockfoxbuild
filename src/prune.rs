@@ -5,6 +5,16 @@ use std::{collections::HashMap, process::Stdio};
 
 use crate::{duration::Duration, size::Size};
 
+/// Outcome of attempting to delete an image during pruning.
+enum RemoveOutcome {
+    /// Every tag was removed (or the image had none), so the image was freed.
+    Removed,
+    /// The image is still referenced by a container and was left in place.
+    InUse,
+    /// Removal failed for some other reason.
+    Failed,
+}
+
 /// Arguments for the prune command, including age thresholds and cache size limits.
 #[derive(clap::Parser)]
 pub struct PruneArgs {
@@ -51,6 +61,9 @@ struct ContainerInspect {
 struct ImageInfo {
     /// The image ID, typically a sha256 hash.
     id: String,
+    /// The names (tags) attached to the image. May be absent/null when the image is dangling.
+    #[serde(default)]
+    names: Vec<String>,
     /// The size of the image as a human-readable string (e.g., "123 MB").
     size: Size,
     /// The creation time of the image as a raw string in RFC3339 format.
@@ -62,6 +75,8 @@ struct ImageInfo {
 struct ImageInfo2 {
     /// The image ID, typically a sha256 hash without the "sha256:" prefix.
     id: String,
+    /// The names (tags) attached to the image.
+    names: Vec<String>,
     /// The size of the image in bytes.
     size: u64,
     /// The creation time of the image as a Unix timestamp (seconds since epoch).
@@ -85,6 +100,51 @@ fn run_command(cmd: &mut std::process::Command, quiet: bool) -> Result<std::proc
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
     }
     Ok(output)
+}
+
+/// Delete an image by removing each of its tags (or by ID if it is untagged).
+///
+/// Removal is always done by tag rather than by ID: deleting the final tag deletes the
+/// image without `--force`, so if a concurrent build has since created a container from
+/// or added a new tag to this image ID, the deletion fails gracefully instead of yanking
+/// the image out from under the running build.
+///
+/// An "image is in use by a container" failure is expected (the image is legitimately in
+/// use) and is reported as [`RemoveOutcome::InUse`] without printing anything. Any other
+/// failure prints buildah's stderr and is reported as [`RemoveOutcome::Failed`].
+fn remove_image(info: &ImageInfo2) -> Result<RemoveOutcome> {
+    let targets: Vec<&str> = if info.names.is_empty() {
+        vec![info.id.as_str()]
+    } else {
+        info.names.iter().map(String::as_str).collect()
+    };
+    let mut all_ok = true;
+    let mut in_use = false;
+    for target in targets {
+        let output = std::process::Command::new("buildah")
+            .args(["rmi", target])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("Failed to run buildah rmi {}", target))?;
+        if output.status.success() {
+            continue;
+        }
+        all_ok = false;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("image is in use by a container") {
+            in_use = true;
+        } else if !stderr.is_empty() {
+            eprint!("{}", stderr);
+        }
+    }
+    Ok(if all_ok {
+        RemoveOutcome::Removed
+    } else if in_use {
+        RemoveOutcome::InUse
+    } else {
+        RemoveOutcome::Failed
+    })
 }
 
 /// Prune old buildah images and containers based on age and cache size limits.
@@ -214,6 +274,7 @@ pub fn prune(args: PruneArgs) -> Result<()> {
             id.clone(),
             ImageInfo2 {
                 id,
+                names: image.names,
                 size,
                 time,
                 checkpoints: Vec::new(),
@@ -276,6 +337,7 @@ pub fn prune(args: PruneArgs) -> Result<()> {
     let now = chrono::Utc::now().timestamp() as u64;
     let mut removed_count = 0;
     let mut failure_count = 0;
+    let mut in_use_count = 0;
     let mut bt = now;
     for info in &images {
         let age = now.saturating_sub(info.time);
@@ -293,27 +355,25 @@ pub fn prune(args: PruneArgs) -> Result<()> {
             bt = info.time;
             break;
         }
-        let output = run_command(
-            std::process::Command::new("buildah").args(["rmi", &info.id]),
-            args.quiet,
-        )
-        .with_context(|| format!("Failed to remove image {}", info.id))?;
-        if output.status.success() {
-            freed += info.size;
-            removed_count += 1;
-        } else {
-            failure_count += 1;
+        match remove_image(info)? {
+            RemoveOutcome::Removed => {
+                freed += info.size;
+                removed_count += 1;
+            }
+            RemoveOutcome::InUse => in_use_count += 1,
+            RemoveOutcome::Failed => failure_count += 1,
         }
     }
 
     if !args.quiet {
         println!(
-            "Freed {} out of {}, oldest image age: {}; {} total images, removed: {}, failed: {}",
+            "Freed {} out of {}, oldest image age: {}; {} total images, removed: {}, in use: {}, failed: {}",
             Size(freed),
             Size(sum),
             Duration(now - bt),
             images.len(),
             removed_count,
+            in_use_count,
             failure_count
         );
     }
