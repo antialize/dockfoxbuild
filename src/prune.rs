@@ -63,7 +63,7 @@ struct ImageInfo {
     id: String,
     /// The names (tags) attached to the image. May be absent/null when the image is dangling.
     #[serde(default)]
-    names: Vec<String>,
+    names: Option<Vec<String>>,
     /// The size of the image as a human-readable string (e.g., "123 MB").
     size: Size,
     /// The creation time of the image as a raw string in RFC3339 format.
@@ -113,7 +113,8 @@ fn run_command(cmd: &mut std::process::Command, quiet: bool) -> Result<std::proc
 /// use) and is reported as [`RemoveOutcome::InUse`] without printing anything. Any other
 /// failure prints buildah's stderr and is reported as [`RemoveOutcome::Failed`].
 fn remove_image(info: &ImageInfo2) -> Result<RemoveOutcome> {
-    let targets: Vec<&str> = if info.names.is_empty() {
+    let by_id = info.names.is_empty();
+    let targets: Vec<&str> = if by_id {
         vec![info.id.as_str()]
     } else {
         info.names.iter().map(String::as_str).collect()
@@ -132,7 +133,10 @@ fn remove_image(info: &ImageInfo2) -> Result<RemoveOutcome> {
         }
         all_ok = false;
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("image is in use by a container") {
+        if stderr.contains("image is in use by a container") || by_id {
+            // For ID-based removal of untagged images, any failure is treated as a
+            // benign race: the image may have been tagged or adopted by a container
+            // between listing and removal.
             in_use = true;
         } else if !stderr.is_empty() {
             eprint!("{}", stderr);
@@ -274,7 +278,7 @@ pub fn prune(args: PruneArgs) -> Result<()> {
             id.clone(),
             ImageInfo2 {
                 id,
-                names: image.names,
+                names: image.names.unwrap_or_default(),
                 size,
                 time,
                 checkpoints: Vec::new(),
