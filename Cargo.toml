@@ -9,6 +9,7 @@ blake3 = "1"
 chrono = "0.4"
 clap = {version = "4", features = ["derive"]}
 crossbeam = {version = "0.8", features = ["crossbeam-channel"]}
+glob = "0.3"
 ignore = "0.4"
 rusqlite = {version = "0.40", features = ["bundled"]}
 serde = {version = "1", features = ["derive"]}
