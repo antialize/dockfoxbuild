@@ -1,5 +1,5 @@
 //! This module implements the logic for handling COPY instructions in the Dockerfile.
-use std::{io::Read, os::unix::ffi::OsStrExt, process::Stdio};
+use std::{io::Read, os::unix::ffi::OsStrExt, path::Path, path::PathBuf, process::Stdio};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -58,6 +58,39 @@ pub fn add_can_hash(line: &str) -> bool {
     }
 }
 
+/// Characters that make a source pattern a glob, matching the wildcards recognized by
+/// buildah/Go's `filepath.Glob` (`*`, `?`, and `[...]` character classes). Brace
+/// alternation is intentionally excluded because Go does not expand it either.
+const GLOB_CHARS: [char; 3] = ['*', '?', '['];
+
+/// Expands a single COPY/ADD source into the concrete paths (rooted at the context
+/// directory) that it refers to.
+///
+/// buildah expands glob patterns in COPY/ADD sources against the build context, so we
+/// must do the same before hashing; otherwise a pattern like `backend/*.cc` would be
+/// treated as a literal (non-existent) path and contribute nothing to the hash, leaving
+/// the cache stale when the matched files change. Sources without glob characters are
+/// returned unchanged so behavior is identical to before for plain paths.
+fn expand_source(ctx: &Path, source: &str) -> Vec<PathBuf> {
+    if !source.contains(GLOB_CHARS) {
+        return vec![ctx.join(source)];
+    }
+    // Escape the context directory so any special characters in it are treated literally,
+    // then append the (unescaped) glob pattern from the source.
+    let pattern = format!(
+        "{}/{}",
+        glob::Pattern::escape(&ctx.to_string_lossy()),
+        source
+    );
+    match glob::glob(&pattern) {
+        Ok(paths) => paths.filter_map(std::result::Result::ok).collect(),
+        Err(e) => {
+            println!("Failed to expand glob '{}': {}", source, e);
+            Vec::new()
+        }
+    }
+}
+
 /// Hashes the contents of the files being copied by a COPY instruction.
 /// This function walks through the source files specified in the COPY instruction,
 /// computes a hash for each file (including its path and content), and combines them
@@ -74,19 +107,32 @@ pub fn hash_sources(line: &str, state: &mut State, hasher: &mut blake3::Hasher) 
     )
     .context("Failed to parse COPY/ADD arguments")?;
 
-    let (first_source, rest) = args
+    let (_dest, sources) = args
         .rest
-        .split_first()
+        .split_last()
         .context("No source files specified")?;
-    let (_dest, additional_sources) = rest.split_last().context("No destination specified")?;
 
     let (tx, rx) = std::sync::mpsc::channel::<[u8; 32]>();
     let ctx = &state.context_dir;
 
-    let mut builder = WalkBuilder::new(ctx.join(first_source));
+    // Expand any glob patterns in the sources into concrete paths, mirroring buildah.
+    let expanded: Vec<PathBuf> = sources
+        .iter()
+        .flat_map(|src| expand_source(ctx, src))
+        .collect();
+
+    let mut expanded = expanded.iter();
+    let Some(first) = expanded.next() else {
+        // No files matched the sources (e.g. globs with no matches); hash an empty set so
+        // the result stays consistent instead of failing.
+        hasher.update(&0usize.to_le_bytes());
+        return Ok(());
+    };
+
+    let mut builder = WalkBuilder::new(first);
     builder.hidden(false);
-    for src in additional_sources {
-        builder.add(ctx.join(src));
+    for src in expanded {
+        builder.add(src);
     }
 
     let walker = builder.build_parallel();
