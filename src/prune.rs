@@ -216,11 +216,21 @@ pub fn prune(args: PruneArgs) -> Result<()> {
         }
 
         // Inspect container to get creation time
-        let output = run_command(
-            std::process::Command::new("buildah").args(["inspect", &container.id]),
-            args.quiet,
-        )?;
+        let output = std::process::Command::new("buildah")
+            .args(["inspect", &container.id])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("Failed to run buildah inspect {}", container.id))?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("image not known") || stderr.contains("container not known") {
+                // Race: the container or its backing image was removed between listing and inspection.
+                continue;
+            }
+            if !output.stderr.is_empty() {
+                eprint!("{}", stderr);
+            }
             bail!(
                 "Failed to inspect container {}: {}",
                 container.id,
@@ -239,11 +249,21 @@ pub fn prune(args: PruneArgs) -> Result<()> {
         if !args.quiet {
             println!("Pruning container {} (age: {})", container.id, age);
         }
-        let output = run_command(
-            std::process::Command::new("buildah").args(["rm", &container.id]),
-            args.quiet,
-        )?;
+        let output = std::process::Command::new("buildah")
+            .args(["rm", &container.id])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("Failed to run buildah rm {}", container.id))?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("container not known") || stderr.contains("image not known") {
+                // Race: already removed.
+                continue;
+            }
+            if !output.stderr.is_empty() {
+                eprint!("{}", stderr);
+            }
             bail!(
                 "Failed to remove container {}: {}",
                 container.id,
