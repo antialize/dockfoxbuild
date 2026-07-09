@@ -630,6 +630,8 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
             ppops.push(Preprocessed::From(line));
         }
         Operation::Checkpoint => {
+            hasher.update("\0CHECKPOINT\0".as_bytes());
+            hasher.update(state.last_id.as_bytes());
             ppops.push(Preprocessed::Checkpoint(first_line.clone()));
         }
         _ => unreachable!("First instruction in chunk should be FROM or CHECKPOINT"),
