@@ -616,7 +616,23 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
             } else {
                 let image = match state.as_images.get(from) {
                     Some(image) => image.clone(),
-                    None => {
+                    None => loop {
+                        // Lock whatever ID this reference currently resolves to locally,
+                        // *before* pulling: `--policy always` below rewrites that same ID
+                        // with fresh registry content, and a concurrent prune considers it
+                        // fair game the whole time otherwise, since it isn't "in use" until
+                        // the pull finishes and lock_image runs after it.
+                        if let Some(existing) = std::process::Command::new("buildah")
+                            .args(["images", "--format", "{{.ID}}", from])
+                            .output()
+                            .ok()
+                            .filter(|o| o.status.success())
+                            .and_then(|o| String::from_utf8(o.stdout).ok())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                        {
+                            lock_image(state, &existing)?;
+                        }
                         // `--policy always` is required for cache correctness:
                         // buildah's default pull policy is `missing`, which
                         // returns a locally-cached image *without* contacting
@@ -639,13 +655,34 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
                             .then_some(())
                             .ok_or_else(|| anyhow::anyhow!("Failed to pull image: {}", from))?;
                         let image = String::from_utf8(out.stdout)?.trim().to_string();
-                        state.db.execute(
-                            "INSERT OR REPLACE INTO remote_images (buildah_id, last_used_at) VALUES (?1, unixepoch())",
-                            rusqlite::params![image],
-                        )?;
-                        image
-                    }
+                        // Lock, then verify: pulling and locking are separate syscalls, so a
+                        // concurrent prune can still delete the image in between. Re-pull on
+                        // that rare miss instead of failing the build outright.
+                        lock_image(state, &image)?;
+                        let status = std::process::Command::new("buildah")
+                            .args(["images", "--format", "{{.ID}}", &image])
+                            .stdout(Stdio::null())
+                            .status()
+                            .with_context(|| {
+                                format!("Failed to check if image exists: {}", image)
+                            })?;
+                        if status.success() {
+                            state.db.execute(
+                                "INSERT OR REPLACE INTO remote_images (buildah_id, last_used_at) VALUES (?1, unixepoch())",
+                                rusqlite::params![image],
+                            )?;
+                            break image;
+                        }
+                        println!(
+                            "\x1b[31mCACHE FAILURE\x1b[0m Lost race with prune for {}, retrying pull",
+                            image
+                        );
+                        state.image_locks.remove(&image);
+                    },
                 };
+                // Idempotent: already locked above when freshly pulled, but as_images entries
+                // (committed earlier in this build) still need to be claimed here.
+                lock_image(state, &image)?;
                 let out = std::process::Command::new("buildah")
                     .args([
                         "inspect",
