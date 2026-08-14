@@ -10,6 +10,7 @@ use crate::{
     copy::{add_can_hash, copy_can_hash, execute_add, execute_copy, hash_sources},
     db::{cache_image_name, connect_db},
     dockerignore::load_gitignore,
+    lock::lock_dir,
     parse::parse_dockerfile,
     state::{Operation, OutOfBandWork, State},
     substitute::substitute,
@@ -105,34 +106,38 @@ fn execute_from(line: &str, state: &mut State) -> Result<()> {
     if let Some(format) = &state.format {
         cmd.args(["--format", format]);
     }
-    let out = cmd
+    // Claim the name before the container exists, so a concurrent prune never sees it unowned.
+    let lock = crate::lock::Lock::new_container(&state.lock_dir)?;
+    cmd.args(["--name", lock.name()]);
+    let status = cmd
         .arg(from)
+        .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .output()
+        .status()
         .with_context(|| format!("Failed to pull image: {}", from))?;
-    out.status
+    status
         .success()
         .then_some(())
         .ok_or_else(|| anyhow::anyhow!("Failed to pull image: {}", from))?;
-    let container = String::from_utf8(out.stdout)?.trim().to_string();
 
-    state.container = Some(container);
+    state.container = Some(lock);
     Ok(())
 }
 
 /// Execute checkpoint instruction by creating a new container from the last checkpoint and setting it as the current container in the build state.
 fn execute_checkpoint(_line: &str, state: &mut State) -> Result<()> {
     println!("\x1b[34mCHECKPOINT\x1b[0m");
+    let lock = crate::lock::Lock::new_container(&state.lock_dir)?;
     let out = std::process::Command::new("buildah")
-        .args(["from", state.last_id.as_ref()])
+        .args(["from", "--name", lock.name(), state.last_id.as_ref()])
+        .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .output()
+        .status()
         .context("Failed to create checkpoint container")?;
-    if !out.status.success() {
-        anyhow::bail!("Failed to create checkpoint container: {:?}", out.status);
+    if !out.success() {
+        anyhow::bail!("Failed to create checkpoint container: {:?}", out);
     }
-    let container = String::from_utf8(out.stdout)?.trim().to_string();
-    state.container = Some(container);
+    state.container = Some(lock);
     Ok(())
 }
 
@@ -148,15 +153,30 @@ fn execute_env(line: &str, state: &mut State) -> Result<()> {
         cmd.arg(part);
     }
     cmd.arg(
-        state.container.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("ENV instruction must be used after a FROM instruction")
-        })?,
+        state
+            .container
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("ENV instruction must be used after a FROM instruction")
+            })?
+            .name(),
     );
     let out = cmd
         .status()
         .with_context(|| format!("Failed to set environment variables: {}", line))?;
     if !out.success() {
         anyhow::bail!("Failed to set environment variables: {}", line);
+    }
+    Ok(())
+}
+
+/// Take a lock on an image this build depends on, so a concurrent prune cannot delete it.
+fn lock_image(state: &mut State, id: &str) -> Result<()> {
+    if !state.image_locks.contains_key(id) {
+        state.image_locks.insert(
+            id.to_string(),
+            crate::lock::Lock::image(&state.lock_dir, id)?,
+        );
     }
     Ok(())
 }
@@ -186,9 +206,13 @@ pub fn execute_run(line: &str, state: &mut State, args: &[(String, String)]) -> 
         cmd.arg(format!("{}={}", key, value));
     }
     cmd.arg(
-        state.container.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("RUN instruction must be used after a FROM instruction")
-        })?,
+        state
+            .container
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("RUN instruction must be used after a FROM instruction")
+            })?
+            .name(),
     );
     cmd.args(["--", "sh", "-c", line]);
     let out = cmd
@@ -209,9 +233,13 @@ fn execute_workdir(line: &str, state: &mut State) -> Result<()> {
             "config",
             "--workingdir",
             line,
-            state.container.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("WORKDIR instruction must be used after a FROM instruction")
-            })?,
+            state
+                .container
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("WORKDIR instruction must be used after a FROM instruction")
+                })?
+                .name(),
         ])
         .status()
         .with_context(|| format!("Failed to set working directory: {}", line))?;
@@ -231,9 +259,15 @@ fn execute_label(line: &str, state: &mut State) -> Result<()> {
         cmd.arg("--label");
         cmd.arg(part);
     }
-    cmd.arg(state.container.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("LABEL instruction must be used after a FROM instruction")
-    })?);
+    cmd.arg(
+        state
+            .container
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("LABEL instruction must be used after a FROM instruction")
+            })?
+            .name(),
+    );
     let out = cmd
         .status()
         .with_context(|| format!("Failed to set labels: {}", line))?;
@@ -251,9 +285,13 @@ fn execute_user(line: &str, state: &mut State) -> Result<()> {
             "config",
             "--user",
             line.trim(),
-            state.container.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("USER instruction must be used after a FROM instruction")
-            })?,
+            state
+                .container
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("USER instruction must be used after a FROM instruction")
+                })?
+                .name(),
         ])
         .status()
         .with_context(|| format!("Failed to set user: {}", line))?;
@@ -283,7 +321,7 @@ fn execute_entrypoint(line: &str, state: &mut State) -> Result<()> {
             &entrypoint,
             "--cmd",
             "[]",
-            container,
+            container.name(),
         ])
         .status()
         .with_context(|| format!("Failed to set entrypoint: {}", line))?;
@@ -307,7 +345,7 @@ fn execute_cmd(line: &str, state: &mut State) -> Result<()> {
         serde_json::to_string(&["/bin/sh", "-c", line.trim()]).context("Failed to serialize CMD")?
     };
     let out = std::process::Command::new("buildah")
-        .args(["config", "--cmd", &cmd_val, container])
+        .args(["config", "--cmd", &cmd_val, container.name()])
         .status()
         .with_context(|| format!("Failed to set cmd: {}", line))?;
     if !out.success() {
@@ -327,7 +365,7 @@ fn execute_expose(line: &str, state: &mut State) -> Result<()> {
     for port in line.split_whitespace() {
         cmd.arg("--port").arg(port);
     }
-    cmd.arg(container);
+    cmd.arg(container.name());
     let out = cmd
         .status()
         .with_context(|| format!("Failed to set exposed ports: {}", line))?;
@@ -353,7 +391,7 @@ fn execute_volume(line: &str, state: &mut State) -> Result<()> {
     for vol in &volumes {
         cmd.arg("--volume").arg(vol);
     }
-    cmd.arg(container);
+    cmd.arg(container.name());
     let out = cmd
         .status()
         .with_context(|| format!("Failed to set volumes: {}", line))?;
@@ -371,9 +409,13 @@ fn execute_stopsignal(line: &str, state: &mut State) -> Result<()> {
             "config",
             "--stop-signal",
             line.trim(),
-            state.container.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("STOPSIGNAL instruction must be used after a FROM instruction")
-            })?,
+            state
+                .container
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("STOPSIGNAL instruction must be used after a FROM instruction")
+                })?
+                .name(),
         ])
         .status()
         .with_context(|| format!("Failed to set stop signal: {}", line))?;
@@ -407,7 +449,7 @@ fn execute_healthcheck(line: &str, state: &mut State) -> Result<()> {
     let trimmed = line.trim();
     if trimmed == "NONE" {
         let out = std::process::Command::new("buildah")
-            .args(["config", "--healthcheck", "NONE", container])
+            .args(["config", "--healthcheck", "NONE", container.name()])
             .status()
             .context("Failed to set HEALTHCHECK NONE")?;
         if !out.success() {
@@ -455,7 +497,7 @@ fn execute_healthcheck(line: &str, state: &mut State) -> Result<()> {
     } else {
         format!("CMD-SHELL {}", test_str)
     };
-    cmd.args(["--healthcheck", &test, container]);
+    cmd.args(["--healthcheck", &test, container.name()]);
     let out = cmd
         .status()
         .with_context(|| format!("Failed to set HEALTHCHECK: {}", line))?;
@@ -935,6 +977,9 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
     };
 
     if let Some(img) = &image {
+        // Lock before verifying the image exists: if a concurrent prune got there first, the
+        // check below downgrades this to a cache miss instead of a mid-build failure.
+        lock_image(state, img)?;
         if state.cache_from.is_some() {
             // Mark the cache image as used on the remote server by pulling it, this will update its last used timestamp on the server and prevent it from being evicted.
             state.obw_tx.send(OutOfBandWork::LruMarkCache {
@@ -977,6 +1022,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
             .with_context(|| format!("Failed to pull cache image: {}", from_name))?;
         if out.status.success() {
             let id = String::from_utf8(out.stdout)?.trim().to_string();
+            lock_image(state, &id)?;
             image = Some(id);
             println!("\x1b[32mCACHE HIT\x1b[0m {}", from_name);
 
@@ -996,7 +1042,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
     {
         if let Some(container) = &state.container {
             let r = std::process::Command::new("buildah")
-                .args(["rm", container])
+                .args(["rm", container.name()])
                 .stdout(Stdio::null())
                 .status()
                 .context("Failed to remove container")?;
@@ -1085,7 +1131,11 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
     let name = cache_image_name(&chunk_hash);
     // Commit the container and delete it
     let out = std::process::Command::new("buildah")
-        .args(["commit", state.container.as_ref().unwrap(), name.as_ref()])
+        .args([
+            "commit",
+            state.container.as_ref().unwrap().name(),
+            name.as_ref(),
+        ])
         .stderr(Stdio::inherit())
         .output()
         .context("Failed to commit container")?;
@@ -1093,6 +1143,7 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
         anyhow::bail!("Failed to commit container: {:?}", out.status);
     }
     let image_id = String::from_utf8(out.stdout)?.trim().to_string();
+    lock_image(state, &image_id)?;
 
     if state.cache_to {
         state.obw_tx.send(OutOfBandWork::PushCache {
@@ -1111,14 +1162,13 @@ fn execute_chunk(ops: &[(Operation, String)], state: &mut State) -> Result<()> {
     state.last_id = image_id;
 
     let r = std::process::Command::new("buildah")
-        .args(["rm", state.container.as_ref().unwrap()])
+        .args(["rm", state.container.as_ref().unwrap().name()])
         .status()
         .context("Failed to remove container")?;
     if !r.success() {
         anyhow::bail!("Failed to remove container: {:?}", r);
     }
     state.container = None;
-
     Ok(())
 }
 
@@ -1206,6 +1256,7 @@ pub fn build_command(args: BuildArgs) -> Result<()> {
         context_dir: args.context,
         db,
         container: Default::default(),
+        image_locks: Default::default(),
         global: Default::default(),
         stage: Default::default(),
         cur_as: Default::default(),
@@ -1219,6 +1270,7 @@ pub fn build_command(args: BuildArgs) -> Result<()> {
         format: args.format,
         network: args.network,
         debug_hash: args.debug_hash,
+        lock_dir: lock_dir()?,
     };
 
     for (key, value) in std::env::vars() {

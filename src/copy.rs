@@ -265,7 +265,7 @@ pub fn execute_copy(line: &str, state: &mut State) -> Result<String> {
     } else {
         cmd.arg("--contextdir").arg(&state.context_dir);
     }
-    cmd.arg(state.container.as_ref().expect("Container").trim());
+    cmd.arg(state.container.as_ref().expect("Container").name());
     cmd.args(args.rest);
     let out = cmd
         .stderr(Stdio::inherit())
@@ -320,7 +320,7 @@ pub fn execute_add(line: &str, state: &mut State) -> Result<String> {
     if let Some(ref checksum) = args.checksum {
         cmd.arg("--checksum").arg(checksum);
     }
-    cmd.arg(state.container.as_ref().expect("Container").trim());
+    cmd.arg(state.container.as_ref().expect("Container").name());
     cmd.args(&args.rest);
     let out = cmd
         .stderr(Stdio::inherit())

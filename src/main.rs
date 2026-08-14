@@ -7,6 +7,7 @@ mod copy;
 mod db;
 mod dockerignore;
 mod duration;
+mod lock;
 mod parse;
 mod prune;
 mod pull;

@@ -1,6 +1,7 @@
 //! State management for the build process, including variable maps, operation types,
 //! and overall build state.
 use crate::dockerignore::DockerIgnore;
+use crate::lock::Lock;
 use std::{collections::HashMap, path::PathBuf};
 
 /// A variable map that combines build arguments and environment variables
@@ -67,8 +68,12 @@ pub struct State {
     /// The Gitignore matcher for the build context, used to determine which files
     /// should be included or excluded from the build context.
     pub ignore: DockerIgnore,
-    /// The current container being built, if any.
-    pub container: Option<String>,
+    /// The current container being built, if any. The lock's name is the container's name,
+    /// which buildah accepts anywhere a container ID does.
+    pub container: Option<Lock>,
+    /// Locks on every image this build still depends on, keyed by image ID. Keyed rather
+    /// than a list because re-locking an image already held by this process would deadlock.
+    pub image_locks: HashMap<String, Lock>,
     /// Global variable map
     pub global: VarMap,
     /// Stage variable map
@@ -99,4 +104,6 @@ pub struct State {
     pub network: Option<String>,
     /// Debug hash
     pub debug_hash: bool,
+    /// Lock dir
+    pub lock_dir: PathBuf,
 }

@@ -6,17 +6,7 @@ use std::{env, path::PathBuf};
 /// Connects to the SQLite database for caching build checkpoints and remote image metadata.
 /// The database is stored in the user's cache directory following the XDG Base Directory Specification.
 pub fn connect_db() -> Result<rusqlite::Connection> {
-    // 1. Check for XDG_CACHE_HOME, fallback to $HOME/.cache
-    let mut cache_path = if let Ok(xdg_cache) = env::var("XDG_CACHE_HOME") {
-        PathBuf::from(xdg_cache)
-    } else {
-        let home = env::var("HOME").context("Neither $XDG_CACHE_HOME nor $HOME is set")?;
-        PathBuf::from(home).join(".cache")
-    };
-
-    // 2. Append your custom client directory and database file name
-    cache_path.push("dockfoxbuild");
-    std::fs::create_dir_all(&cache_path).context("Failed to create cache directory")?;
+    let mut cache_path = cache_dir()?;
     cache_path.push("cache.db");
     let conn = rusqlite::Connection::open(cache_path)?;
     conn.execute_batch(
@@ -40,6 +30,20 @@ pub fn connect_db() -> Result<rusqlite::Connection> {
         ",
     )?;
     Ok(conn)
+}
+
+/// The directory holding this tool's cache database and container locks, following the
+/// XDG Base Directory Specification.
+pub fn cache_dir() -> Result<PathBuf> {
+    let mut cache_path = if let Ok(xdg_cache) = env::var("XDG_CACHE_HOME") {
+        PathBuf::from(xdg_cache)
+    } else {
+        let home = env::var("HOME").context("Neither $XDG_CACHE_HOME nor $HOME is set")?;
+        PathBuf::from(home).join(".cache")
+    };
+    cache_path.push("dockfoxbuild");
+    std::fs::create_dir_all(&cache_path).context("Failed to create cache directory")?;
+    Ok(cache_path)
 }
 
 /// Generates a cache image name based on the given hash, following the format "localhost/dockfoxbuild_cache:{hash}".

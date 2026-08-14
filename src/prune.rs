@@ -1,7 +1,10 @@
 //! Prune old buildah images and containers to free up disk space.
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::{collections::HashMap, process::Stdio};
+use std::{
+    collections::{HashMap, HashSet},
+    process::Stdio,
+};
 
 use crate::{duration::Duration, size::Size};
 
@@ -39,21 +42,10 @@ struct ContainerPsInfo {
     id: String,
     /// Whether this container is a builder container (i.e., created by `buildah from`).
     builder: bool,
-}
-
-/// Information about a container from `buildah inspect --json`.
-#[derive(Debug, Deserialize)]
-struct ContainerOCIV1 {
-    /// The creation time of the container, in RFC3339 format.
-    created: String,
-}
-
-/// Information about a container from `buildah inspect --json`.
-#[derive(Debug, Deserialize)]
-struct ContainerInspect {
-    /// The OCIv1-specific information about the container, including creation time.
-    #[serde(rename = "OCIv1")]
-    ociv1: ContainerOCIV1,
+    /// The container's name. Absent on buildah versions that omit it, in which case we
+    /// cannot establish ownership and leave the container alone.
+    #[serde(default)]
+    containername: Option<String>,
 }
 
 /// Information about an image from `buildah images --json`, including ID, size, and creation time.
@@ -133,10 +125,13 @@ fn remove_image(info: &ImageInfo2) -> Result<RemoveOutcome> {
         }
         all_ok = false;
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("image is in use by a container") || by_id {
-            // For ID-based removal of untagged images, any failure is treated as a
-            // benign race: the image may have been tagged or adopted by a container
-            // between listing and removal.
+        // Only genuine "someone else still needs this" outcomes are races worth ignoring.
+        // Anything else is a real failure and must not be silently discarded, or a storage
+        // problem looks like a successful prune.
+        if stderr.contains("image is in use by a container")
+            || stderr.contains("image not known")
+            || stderr.contains("has dependent child images")
+        {
             in_use = true;
         } else if !stderr.is_empty() {
             eprint!("{}", stderr);
@@ -190,7 +185,7 @@ pub fn prune(args: PruneArgs) -> Result<()> {
             Some(status) => break status,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
-                bail!("buildah ps timed out after 30s");
+                bail!("buildah ps timed out after 90s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(100)),
         }
@@ -210,45 +205,32 @@ pub fn prune(args: PruneArgs) -> Result<()> {
             .context("Listing containers")?
             .unwrap_or_default();
 
+    let lock_dir = crate::lock::lock_dir()?;
+
     for container in containers {
         if !container.builder {
             continue;
         }
 
-        // Inspect container to get creation time
-        let output = std::process::Command::new("buildah")
-            .args(["inspect", &container.id])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("Failed to run buildah inspect {}", container.id))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("image not known") || stderr.contains("container not known") {
-                // Race: the container or its backing image was removed between listing and inspection.
-                continue;
-            }
-            if !output.stderr.is_empty() {
-                eprint!("{}", stderr);
-            }
-            bail!(
-                "Failed to inspect container {}: {}",
-                container.id,
-                output.status
-            );
-        }
-        let inspect: ContainerInspect =
-            serde_json::from_slice(&output.stdout).context("Inspecting container")?;
-        let created = chrono::DateTime::parse_from_rfc3339(&inspect.ociv1.created)
-            .context("Parsing container creation time")?;
-        let age = chrono::Utc::now().signed_duration_since(created);
-        if age < chrono::Duration::hours(1) {
+        // Only ever consider containers this tool created. Anything else belongs to another
+        // buildah user and we have no way to tell whether it is in use.
+        let Some(name) = container
+            .containername
+            .as_deref()
+            .filter(|name| name.starts_with(crate::lock::CONTAINER_PREFIX))
+        else {
             continue;
-        }
+        };
 
-        if !args.quiet {
-            println!("Pruning container {} (age: {})", container.id, age);
-        }
+        // A running build holds an exclusive lock on its container for as long as the
+        // container exists. Hold it ourselves for the whole removal; dropping it unlinks
+        // the lock file.
+        let Some(_lock) = crate::lock::Lock::try_container(&lock_dir, name)
+            .with_context(|| format!("Checking owner of {}", name))?
+        else {
+            continue;
+        };
+
         let output = std::process::Command::new("buildah")
             .args(["rm", &container.id])
             .stdout(Stdio::null())
@@ -379,6 +361,15 @@ pub fn prune(args: PruneArgs) -> Result<()> {
             bt = info.time;
             break;
         }
+        // A build may depend on an image without holding a container for it, e.g. between
+        // chunks or after a cache hit. Removing it would break that build, so hold the lock
+        // for the whole removal rather than merely testing it.
+        let Some(_lock) = crate::lock::Lock::try_image(&lock_dir, &info.id)
+            .with_context(|| format!("Checking owner of image {}", info.id))?
+        else {
+            in_use_count += 1;
+            continue;
+        };
         match remove_image(info)? {
             RemoveOutcome::Removed => {
                 freed += info.size;
@@ -387,6 +378,18 @@ pub fn prune(args: PruneArgs) -> Result<()> {
             RemoveOutcome::InUse => in_use_count += 1,
             RemoveOutcome::Failed => failure_count += 1,
         }
+    }
+
+    crate::lock::sweep_image_locks(
+        &lock_dir,
+        &images.iter().map(|i| i.id.clone()).collect::<HashSet<_>>(),
+    );
+
+    if failure_count > 0 {
+        eprintln!(
+            "Failed to remove {} image(s); see errors above",
+            failure_count
+        );
     }
 
     if !args.quiet {
