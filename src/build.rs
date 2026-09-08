@@ -1277,8 +1277,17 @@ pub fn oob_worker(
 
 /// Main build function that orchestrates the entire build process, including parsing the Dockerfile, managing the build state,
 /// executing instructions, and handling caching.
-pub fn build_command(args: BuildArgs) -> Result<()> {
+pub fn build_command(mut args: BuildArgs) -> Result<()> {
     let db = connect_db()?;
+
+    // Canonicalize so it has no "." component: glob::glob() silently drops a leading
+    // "./" from matched paths, which would otherwise make `Path::strip_prefix` fail
+    // in hash_sources() and cause files matched via glob COPY/ADD sources to be
+    // skipped from hashing entirely (leading to false cache hits).
+    args.context = args
+        .context
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve context dir: {}", args.context.display()))?;
 
     let file = args.file.unwrap_or_else(|| args.context.join("Dockerfile"));
 

@@ -333,3 +333,175 @@ pub fn execute_add(line: &str, state: &mut State) -> Result<String> {
     let stdout = String::from_utf8(out.stdout)?;
     Ok(stdout)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// A scratch directory under the OS temp dir, canonicalized (as `state.context_dir`
+    /// is in production, see build.rs) so it has no "." component: the `glob` crate
+    /// silently drops a leading "./" from matched paths, which would otherwise make
+    /// these tests fail for reasons unrelated to what they check.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("dockfoxbuild_test_{name}_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir.canonicalize().unwrap())
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn touch(&self, rel: &str) {
+            let p = self.0.join(rel);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(p, "").unwrap();
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Sorts for order-independent comparison; `expand_source` does not guarantee order.
+    fn sorted(mut v: Vec<PathBuf>) -> Vec<PathBuf> {
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn plain_path_without_glob_chars_is_returned_unchanged() {
+        let ctx = TempDir::new("plain");
+        // No glob characters, so the path is joined literally even though it doesn't exist.
+        let result = expand_source(ctx.path(), "does/not/exist.txt");
+        assert_eq!(result, vec![ctx.path().join("does/not/exist.txt")]);
+    }
+
+    #[test]
+    fn star_glob_matches_files_including_dotfiles() {
+        let ctx = TempDir::new("star");
+        ctx.touch("a.txt");
+        ctx.touch("b.txt");
+        ctx.touch(".hidden.txt");
+        ctx.touch("c.log");
+
+        // Go's filepath.Glob (used by buildah) does not treat a leading dot specially,
+        // so "*.txt" must match dotfiles too.
+        let result = sorted(expand_source(ctx.path(), "*.txt"));
+        assert_eq!(
+            result,
+            sorted(vec![
+                ctx.path().join("a.txt"),
+                ctx.path().join("b.txt"),
+                ctx.path().join(".hidden.txt"),
+            ])
+        );
+    }
+
+    #[test]
+    fn star_glob_does_not_descend_into_subdirectories() {
+        let ctx = TempDir::new("star_nodescend");
+        ctx.touch("top.txt");
+        ctx.touch("sub/nested.txt");
+
+        // A single "*" segment matches one path component; "sub" itself matches but
+        // its contents are not expanded.
+        let result = sorted(expand_source(ctx.path(), "*"));
+        assert_eq!(
+            result,
+            sorted(vec![ctx.path().join("top.txt"), ctx.path().join("sub")])
+        );
+    }
+
+    #[test]
+    fn glob_with_subdirectory_prefix_matches_within_that_directory() {
+        let ctx = TempDir::new("subdir_prefix");
+        ctx.touch("backend/Cargo.toml");
+        ctx.touch("backend/Cargo.lock");
+        ctx.touch("backend/src/main.rs");
+
+        let result = sorted(expand_source(ctx.path(), "backend/Cargo.*"));
+        assert_eq!(
+            result,
+            sorted(vec![
+                ctx.path().join("backend/Cargo.toml"),
+                ctx.path().join("backend/Cargo.lock"),
+            ])
+        );
+    }
+
+    #[test]
+    fn question_mark_matches_exactly_one_character() {
+        let ctx = TempDir::new("question_mark");
+        ctx.touch("a.txt");
+        ctx.touch("ab.txt");
+
+        // "a?txt" needs exactly one character between "a" and "txt", so only "a.txt"
+        // qualifies; "ab.txt" has two characters ("b" and ".") and must not match.
+        let result = expand_source(ctx.path(), "a?txt");
+        assert_eq!(result, vec![ctx.path().join("a.txt")]);
+    }
+
+    #[test]
+    fn bracket_char_class_matches_any_listed_character() {
+        let ctx = TempDir::new("bracket_class");
+        ctx.touch("file1.txt");
+        ctx.touch("file2.txt");
+        ctx.touch("file3.txt");
+
+        let result = sorted(expand_source(ctx.path(), "file[12].txt"));
+        assert_eq!(
+            result,
+            sorted(vec![
+                ctx.path().join("file1.txt"),
+                ctx.path().join("file2.txt"),
+            ])
+        );
+    }
+
+    #[test]
+    fn glob_with_no_matches_returns_empty() {
+        let ctx = TempDir::new("no_match");
+        ctx.touch("a.txt");
+
+        assert_eq!(
+            expand_source(ctx.path(), "nomatch*.foo"),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    #[test]
+    fn brace_alternation_is_not_expanded_as_a_glob() {
+        let ctx = TempDir::new("brace");
+        ctx.touch("a.txt");
+        ctx.touch("b.txt");
+
+        // `{a,b}.txt` contains no `*`, `?` or `[`, so unlike shell globs it is treated as
+        // a literal path (matching Go's filepath.Glob, which buildah relies on) rather
+        // than expanded to "a.txt"/"b.txt".
+        let result = expand_source(ctx.path(), "{a,b}.txt");
+        assert_eq!(result, vec![ctx.path().join("{a,b}.txt")]);
+    }
+
+    #[test]
+    fn special_characters_in_context_dir_are_escaped() {
+        let ctx = TempDir::new("special_[chars]");
+        ctx.touch("a.txt");
+
+        // The context directory's own path may legitimately contain glob metacharacters
+        // (e.g. "[chars]" in a repo checkout path); expand_source must escape those so
+        // they aren't misinterpreted as part of the pattern.
+        let result = expand_source(ctx.path(), "*.txt");
+        assert_eq!(result, vec![ctx.path().join("a.txt")]);
+    }
+}
